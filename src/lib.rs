@@ -1,15 +1,107 @@
 //! Rust FFI bindings for StarkWare's [crypto-cpp](https://github.com/starkware-libs/crypto-cpp) library.
 
+extern crate core;
+
+use core::fmt;
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{One, Zero};
+
+pub mod constants;
+pub mod key;
+#[macro_use]
+mod macros;
+mod utils;
+
+pub use key::{PublicKey, SecretKey};
+
+#[derive(Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Debug)]
+pub enum Error {
+    /// Signature failed verification
+    IncorrectSignature,
+    /// Badly sized message ("messages" are actually fixed-sized digests; see the `MESSAGE_SIZE`
+    /// constant)
+    InvalidMessage,
+    /// Bad public key
+    InvalidPublicKey,
+    /// Bad signature
+    InvalidSignature,
+    /// Bad secret key
+    InvalidSecretKey,
+    /// Bad recovery id
+    InvalidRecoveryId,
+    /// Invalid tweak for add_*_assign or mul_*_assign
+    InvalidTweak,
+    /// `tweak_add_check` failed on an xonly public key
+    TweakCheckFailed,
+    /// Didn't pass enough memory to context creation with preallocated memory
+    NotEnoughMemory,
+}
+
+impl Error {
+    fn as_str(&self) -> &str {
+        match *self {
+            Error::IncorrectSignature => "secp: signature failed verification",
+            Error::InvalidMessage => "secp: message was not 32 bytes (do you need to hash?)",
+            Error::InvalidPublicKey => "secp: malformed public key",
+            Error::InvalidSignature => "secp: malformed signature",
+            Error::InvalidSecretKey => "secp: malformed or out-of-range secret key",
+            Error::InvalidRecoveryId => "secp: bad recovery id",
+            Error::InvalidTweak => "secp: bad tweak",
+            Error::TweakCheckFailed => "secp: xonly_pubkey_tewak_add_check failed",
+            Error::NotEnoughMemory => "secp: not enough memory allocated",
+        }
+    }
+}
+
+// Passthrough Debug to Display, since errors should be user-visible
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
+
+
+pub trait CPtr {
+    type Target;
+    fn as_c_ptr(&self) -> *const Self::Target;
+    fn as_mut_c_ptr(&mut self) -> *mut Self::Target;
+}
+
+impl<T> CPtr for [T] {
+    type Target = T;
+    fn as_c_ptr(&self) -> *const Self::Target {
+        if self.is_empty() {
+            ptr::null()
+        } else {
+            self.as_ptr()
+        }
+    }
+
+    fn as_mut_c_ptr(&mut self) -> *mut Self::Target {
+        if self.is_empty() {
+            ptr::null_mut::<Self::Target>()
+        } else {
+            self.as_mut_ptr()
+        }
+    }
+}
+
 
 const CURVE_ORDER_LE: [u8; 32] = [
     47, 77, 198, 173, 65, 162, 102, 30, 50, 178, 231, 202, 109, 18, 129, 183, 255, 255, 255, 255,
     255, 255, 255, 255, 16, 0, 0, 0, 0, 0, 0, 8,
 ];
 
+use ::std::os::raw::{c_char, c_int};
+use std::ptr;
+
 extern "C" {
+
+
     fn Hash(
         in1: *const ::std::os::raw::c_char,
         in2: *const ::std::os::raw::c_char,
@@ -182,6 +274,7 @@ fn invert_on_curve(num: &[u8; 32]) -> [u8; 32] {
 
     result
 }
+
 
 #[cfg(test)]
 mod tests {
