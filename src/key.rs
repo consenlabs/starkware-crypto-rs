@@ -122,19 +122,32 @@ fn random_32_bytes<R: Rng + ?Sized>(rng: &mut R) -> [u8; 32] {
   ret
 }
 
+
 fn is_sk_validation(data: &[u8]) -> bool {
-  true
+  let mut buffer = [0u8; MAX_BUFFER_SIZE];
+  let mut sk = data.to_vec().clone();
+  sk.reverse();
+  unsafe {
+    let res = SeckeyValidate(sk.as_ptr(), buffer.as_mut_ptr());
+    return res == 0;
+  }
 }
 
 
 use ::std::os::raw::{c_uchar, c_int};
 use std::os::raw::c_uint;
 use std::ptr;
+use std::sync::atomic;
+use generic_array::GenericArray;
 use rand::Rng;
+use zeroize::Zeroize;
+use crate::Error::InvalidTweak;
 
 extern "C" {
   // keys
+  fn SeckeyValidate(sk: *const c_uchar, out: *mut c_uchar) -> c_int;
   fn SeckeyNegate(sk: *const c_uchar, out: *mut c_uchar) -> c_int;
+  fn SeckeyInvert(sk: *const c_uchar, out: *mut c_uchar) -> c_int;
   fn SeckeyTweakAdd(sk: *const c_uchar, other: *const c_uchar, out: *mut c_uchar) -> c_int;
   fn SeckeyTweakMul(sk: *const c_uchar, other: *const c_uchar, out: *mut c_uchar) -> c_int;
 
@@ -148,6 +161,22 @@ extern "C" {
   fn GetPublicKey(private_key: *const c_uchar, out: *mut c_uchar) -> c_int;
 }
 
+impl Zeroize for SecretKey {
+  fn zeroize(&mut self) {
+    let sk = self.as_mut_ptr();
+    let sk_bytes = unsafe { std::slice::from_raw_parts_mut(sk, 32) };
+    sk_bytes.zeroize()
+  }
+}
+
+impl Zeroize for PublicKey {
+  fn zeroize(&mut self) {
+    // let zeroed = [0u8; 64].as_ptr();
+    unsafe { ptr::write_volatile(self.0.as_mut_ptr(), 0) };
+    atomic::compiler_fence(atomic::Ordering::SeqCst);
+  }
+}
+
 impl SecretKey {
   /// Creates a new random secret key. Requires compilation with the "rand" feature.
   #[inline]
@@ -159,13 +188,24 @@ impl SecretKey {
     SecretKey(data)
   }
 
+  pub fn zero() -> Self {
+    SecretKey([0u8; SECRET_KEY_SIZE])
+  }
+
+  pub fn is_zero(&self) -> bool {
+    return self.0 == [0u8; SECRET_KEY_SIZE];
+  }
+
   /// Converts a `SECRET_KEY_SIZE`-byte slice to a secret key
   #[inline]
   pub fn from_slice(data: &[u8]) -> Result<SecretKey, Error> {
+    if (data == [0u8; SECRET_KEY_SIZE]) {
+      return Ok(Self::zero());
+    }
     match data.len() {
       constants::SECRET_KEY_SIZE => {
         let mut ret = [0; constants::SECRET_KEY_SIZE];
-        if !is_sk_validation(&ret) {
+        if !is_sk_validation(&data) {
           return Err(Error::InvalidSecretKey);
         }
         ret[..].copy_from_slice(data);
@@ -175,9 +215,33 @@ impl SecretKey {
     }
   }
 
+  pub fn to_bytes(&self) -> GenericArray<u8, typenum::U32> {
+    GenericArray::from_slice(&self.0).clone()
+  }
+
+  #[inline]
+  pub fn invert_assign(&mut self) -> Result<(), Error> {
+    let mut buffer = [0u8; MAX_BUFFER_SIZE];
+    unsafe {
+      self.0.reverse();
+      let res = SeckeyInvert(
+        self.as_c_ptr(),
+        buffer.as_mut_ptr(),
+      );
+      if res == 0 {
+        self.0.copy_from_slice(&buffer[0..SECRET_KEY_SIZE]);
+        self.0.reverse();
+        return Ok(());
+      } else {
+        self.0.reverse();
+        return Err(Error::InvalidTweak);
+      }
+    };
+  }
+
   #[inline]
   /// Negates one secret key.
-  pub fn negate_assign(&mut self) {
+  pub fn negate_assign(&mut self) -> Result<(), Error> {
     let mut buffer = [0u8; MAX_BUFFER_SIZE];
     unsafe {
       self.0.reverse();
@@ -187,9 +251,12 @@ impl SecretKey {
       );
       if res == 0 {
         self.0.copy_from_slice(&buffer[0..SECRET_KEY_SIZE]);
+        self.0.reverse();
+        return Ok(());
+      } else {
+        self.0.reverse();
+        return Err(Error::InvalidTweak);
       }
-      self.0.reverse();
-      debug_assert_eq!(res, 1);
     };
   }
 
@@ -199,7 +266,7 @@ impl SecretKey {
   /// the tweak was not a 32-byte length slice.
   pub fn add_assign(
     &mut self,
-    other: &[u8],
+    other: &Self,
   ) -> Result<(), Error> {
     if other.len() != 32 {
       return Err(Error::InvalidTweak);
@@ -207,9 +274,11 @@ impl SecretKey {
     let mut buffer = [0u8; MAX_BUFFER_SIZE];
     unsafe {
       self.0.reverse();
+      let mut other_copy = other.0.clone();
+      other_copy.reverse();
       if SeckeyTweakAdd(
         self.as_c_ptr(),
-        other.as_c_ptr(),
+        other_copy.as_c_ptr(),
         buffer.as_mut_ptr(),
       ) != 0
       {
@@ -229,7 +298,7 @@ impl SecretKey {
   /// the tweak was not a 32-byte length slice.
   pub fn mul_assign(
     &mut self,
-    other: &[u8],
+    &other: &Self,
   ) -> Result<(), Error> {
     if other.len() != 32 {
       return Err(Error::InvalidTweak);
@@ -237,9 +306,11 @@ impl SecretKey {
     let mut buffer = [0u8; MAX_BUFFER_SIZE];
     unsafe {
       self.0.reverse();
+      let mut other_copy = other.0.clone();
+      other_copy.reverse();
       if SeckeyTweakMul(
         self.as_mut_c_ptr(),
-        other.as_c_ptr(),
+        other_copy.as_c_ptr(),
         buffer.as_mut_ptr(),
       ) != 0
       {
@@ -253,33 +324,31 @@ impl SecretKey {
     }
   }
 }
-
-#[cfg(feature = "serde")]
-impl ::serde::Serialize for SecretKey {
-  fn serialize<S: ::serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-    if s.is_human_readable() {
-      s.collect_str(self)
-    } else {
-      s.serialize_bytes(&self[..])
-    }
-  }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> ::serde::Deserialize<'de> for SecretKey {
-  fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-    if d.is_human_readable() {
-      d.deserialize_str(super::serde_util::FromStrVisitor::new(
-        "a hex string representing 32 byte SecretKey"
-      ))
-    } else {
-      d.deserialize_bytes(super::serde_util::BytesVisitor::new(
-        "raw 32 bytes SecretKey",
-        SecretKey::from_slice,
-      ))
-    }
-  }
-}
+//
+// impl ::serde::Serialize for SecretKey {
+//   fn serialize<S: ::serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+//     if s.is_human_readable() {
+//       s.collect_str(self)
+//     } else {
+//       s.serialize_bytes(&self[..])
+//     }
+//   }
+// }
+//
+// impl<'de> ::serde::Deserialize<'de> for SecretKey {
+//   fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+//     if d.is_human_readable() {
+//       d.deserialize_str(super::serde_util::FromStrVisitor::new(
+//         "a hex string representing 32 byte SecretKey"
+//       ))
+//     } else {
+//       d.deserialize_bytes(super::serde_util::BytesVisitor::new(
+//         "raw 32 bytes SecretKey",
+//         SecretKey::from_slice,
+//       ))
+//     }
+//   }
+// }
 
 impl PublicKey {
   // /// Obtains a raw const pointer suitable for use with FFI functions
@@ -293,6 +362,16 @@ impl PublicKey {
   // pub fn as_mut_ptr(&mut self) -> *mut u8 {
   //   self.0.as_mut_ptr()
   // }
+
+  pub fn zero() -> Self {
+    let zero = [0u8; 64];
+    PublicKey(zero)
+  }
+
+  pub fn is_zero(&self) -> bool {
+    self == &Self::zero()
+  }
+
 
   /// Creates a new public key from a secret key.
   #[inline]
@@ -324,6 +403,7 @@ impl PublicKey {
     output.copy_from_slice(&[x_bytes, y_bytes].concat());
     PublicKey(output)
   }
+
   fn convert_pk_to_le(data: &[u8]) -> Vec<u8> {
     let mut pub_key_bytes = vec!();
     match data.len() {
@@ -440,6 +520,21 @@ impl PublicKey {
   // todo: no a real combine
   pub fn combine(&self, other: &PublicKey) -> Result<PublicKey, Error> {
     let mut buffer = [0u8; 1024];
+    if self.is_zero() {
+      if other.is_zero() {
+        return Ok(Self::zero());
+      } else {
+        return Ok(other.clone());
+      }
+    }
+
+    if other.is_zero() {
+      if self.is_zero() {
+        return Ok(Self::zero());
+      } else {
+        return Ok(self.clone());
+      }
+    }
     unsafe {
       let pk_in_le = Self::convert_pk_to_le(&self.0);
       let other_pk_in_le = Self::convert_pk_to_le(&other.0);
@@ -447,7 +542,8 @@ impl PublicKey {
         let pk_in_be = Self::parse_pk_from_le(&buffer);
         Ok(pk_in_be)
       } else {
-        Err(Error::InvalidTweak)
+        println!("public key add error: {}", str::from_utf8(&buffer).unwrap());
+        Ok(Self::zero())
       }
     }
   }
@@ -456,16 +552,22 @@ impl PublicKey {
   /// Muliplies the pk `self` in place by the scalar `other`
   /// Will return an error if the resulting key would be invalid or
   /// if the tweak was not a 32-byte length slice.
-  pub fn mul_assign(&mut self, other: &[u8]) -> Result<(), Error> {
+  pub fn mul_assign(&mut self, other: &SecretKey) -> Result<(), Error> {
     if other.len() != 32 {
       return Err(Error::InvalidTweak);
+    }
+    if other.0 == [0u8; SECRET_KEY_SIZE] || self.is_zero() {
+      self.0 = [0u8; 64];
+      return Ok(());
     }
     let mut buffer = [0u8; 1024];
     unsafe {
       let pk_in_le = Self::convert_pk_to_le(&self.0);
       let mut other_bytes = [0u8; SECRET_KEY_SIZE];
-      other_bytes.copy_from_slice(other);
+      other_bytes.copy_from_slice(&other.0);
       other_bytes.reverse();
+
+      println!("need rebuild 02");
 
       if PubkeyTweakMul(pk_in_le.as_c_ptr(), other_bytes.as_ptr(), buffer.as_mut_ptr()) == 0 {
         let pk_in_be = Self::parse_pk_from_le(&buffer);
@@ -529,33 +631,31 @@ impl PublicKey {
 //     PublicKey(pk)
 //   }
 // }
-
-#[cfg(feature = "serde")]
-impl ::serde::Serialize for PublicKey {
-  fn serialize<S: ::serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-    if s.is_human_readable() {
-      s.collect_str(self)
-    } else {
-      s.serialize_bytes(&self.serialize())
-    }
-  }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> ::serde::Deserialize<'de> for PublicKey {
-  fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> Result<PublicKey, D::Error> {
-    if d.is_human_readable() {
-      d.deserialize_str(super::serde_util::FromStrVisitor::new(
-        "an ASCII hex string representing a public key"
-      ))
-    } else {
-      d.deserialize_bytes(super::serde_util::BytesVisitor::new(
-        "a bytestring representing a public key",
-        PublicKey::from_slice,
-      ))
-    }
-  }
-}
+//
+// impl ::serde::Serialize for PublicKey {
+//   fn serialize<S: ::serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+//     if s.is_human_readable() {
+//       s.collect_str(self)
+//     } else {
+//       s.serialize_bytes(&self.serialize())
+//     }
+//   }
+// }
+//
+// impl<'de> ::serde::Deserialize<'de> for PublicKey {
+//   fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> Result<PublicKey, D::Error> {
+//     if d.is_human_readable() {
+//       d.deserialize_str(super::serde_util::FromStrVisitor::new(
+//         "an ASCII hex string representing a public key"
+//       ))
+//     } else {
+//       d.deserialize_bytes(super::serde_util::BytesVisitor::new(
+//         "a bytestring representing a public key",
+//         PublicKey::from_slice,
+//       ))
+//     }
+//   }
+// }
 //
 // impl PartialOrd for PublicKey {
 //   fn partial_cmp(&self, other: &PublicKey) -> Option<::core::cmp::Ordering> {
@@ -569,6 +669,162 @@ impl<'de> ::serde::Deserialize<'de> for PublicKey {
 //   }
 // }
 //
+
+#[cfg(test)]
+mod test {
+  use hex_literal::hex;
+  use crate::{PublicKey, SecretKey};
+  use crate::key::convert_vec_to_array;
+  use super::is_sk_validation;
+
+  #[test]
+  fn test_is_sk_validation() {
+    let zero = [0u8; 32];
+    assert_eq!(false, is_sk_validation(&zero));
+  }
+
+  #[test]
+  fn test_from_sk() {
+    let one = hex!("0000000000000000000000000000000000000000000000000000000000000001");
+    let sk_one = SecretKey::from_slice(&one);
+    let pk = PublicKey::from_secret_key(&sk_one.unwrap());
+    assert_eq!("0301ef15c18599971b7beced415a40f0c7deacfd9b0d1819e03d723d8bc943cfca", hex::encode(pk.serialize()));
+  }
+
+  #[test]
+  fn test_parse_pubkey() {
+    let compressed_pk = hex!("03053bbcaee4f23084e173fc2df3e50d2c2d7bccd5ce626b2158e324df1eb60125");
+    let cpk = PublicKey::from_slice(&compressed_pk);
+    assert!(cpk.is_ok());
+
+
+    assert_eq!(hex!("03053bbcaee4f23084e173fc2df3e50d2c2d7bccd5ce626b2158e324df1eb60125"), cpk.unwrap().serialize());
+
+    let even_compressed_pk = hex!("020523658a604e7383f7ae24c011b1f94973a294303f8d7adfde4bbac56e434344");
+    let cpk = PublicKey::from_slice(&even_compressed_pk);
+
+    assert_eq!(hex!("020523658a604e7383f7ae24c011b1f94973a294303f8d7adfde4bbac56e434344"), cpk.unwrap().serialize());
+  }
+
+  #[test]
+  fn test_pubkey_add() {
+    let one = hex!("0000000000000000000000000000000000000000000000000000000000000001");
+
+    let two = hex!("0000000000000000000000000000000000000000000000000000000000000002");
+    let three = hex!("0000000000000000000000000000000000000000000000000000000000000003");
+    let sk_one = SecretKey::from_slice(&one).unwrap();
+    let sk_two = SecretKey::from_slice(&two).unwrap();
+    let sk_three = SecretKey::from_slice(&three).unwrap();
+    let mut pub_key_one = PublicKey::from_secret_key(&sk_one);
+    let mut pub_key_two = PublicKey::from_secret_key(&sk_two);
+
+
+    assert_eq!(PublicKey::from_secret_key(&sk_three), pub_key_one.combine(&pub_key_two).unwrap());
+
+    pub_key_one.add_exp_assign(&pub_key_two);
+    assert_eq!(PublicKey::from_secret_key(&sk_three), pub_key_one);
+  }
+
+
+  #[test]
+  fn test_pubkey_mul() {
+    let one = hex!("0000000000000000000000000000000000000000000000000000000000000001");
+
+    let two = hex!("0000000000000000000000000000000000000000000000000000000000000002");
+    let three = hex!("0000000000000000000000000000000000000000000000000000000000000003");
+    let sk_one = SecretKey::from_slice(&one).unwrap();
+    let sk_three = SecretKey::from_slice(&three).unwrap();
+    let mut pub_key_one = PublicKey::from_secret_key(&sk_one);
+    pub_key_one.mul_assign(&sk_three);
+    assert_eq!(PublicKey::from_secret_key(&sk_three), pub_key_one);
+  }
+
+  #[test]
+  fn test_sk_add() {
+    let one = hex!("0000000000000000000000000000000000000000000000000000000000000001");
+
+    let two = hex!("0000000000000000000000000000000000000000000000000000000000000002");
+    let three = hex!("0000000000000000000000000000000000000000000000000000000000000003");
+    let mut sk_one = SecretKey::from_slice(&one).unwrap();
+    let sk_two = SecretKey::from_slice(&two).unwrap();
+    let sk_three = SecretKey::from_slice(&three).unwrap();
+    sk_one.add_assign(&sk_two);
+    assert_eq!(sk_three, sk_one );
+  }
+
+  #[test]
+  fn test_sk_mul() {
+    let one = hex!("0000000000000000000000000000000000000000000000000000000000000001");
+
+    let two = hex!("0000000000000000000000000000000000000000000000000000000000000002");
+    let three = hex!("0000000000000000000000000000000000000000000000000000000000000003");
+    let mut sk_one = SecretKey::from_slice(&one).unwrap();
+    let sk_two = SecretKey::from_slice(&two).unwrap();
+    let sk_three = SecretKey::from_slice(&three).unwrap();
+    sk_one.mul_assign(&sk_three);
+    assert_eq!(sk_three, sk_one);
+  }
+
+  #[test]
+  fn test_sk_negate() {
+    let one = hex!("0000000000000000000000000000000000000000000000000000000000000001");
+
+    let negate_one = hex!("0800000000000011000000000000000000000000000000000000000000000000");
+    let mut sk_one = SecretKey::from_slice(&one).unwrap();
+    let mut sk_negate_one = SecretKey::from_slice(&negate_one).unwrap();
+    sk_one.negate_assign();
+
+    // let sk_three = SecretKey::from_slice(&three).unwrap();
+    // sk_one.mul_assign(&sk_three.0);
+    assert_eq!("", hex::encode(sk_one.0));
+  }
+
+  #[test]
+  fn test_pk_negate() {
+    let one = hex!("0000000000000000000000000000000000000000000000000000000000000001");
+
+    let two = hex!("0000000000000000000000000000000000000000000000000000000000000002");
+    let three = hex!("0000000000000000000000000000000000000000000000000000000000000003");
+    let mut sk_one = SecretKey::from_slice(&one).unwrap();
+    let mut sk_two = SecretKey::from_slice(&two).unwrap();
+    sk_one.negate_assign();
+
+    // let sk_three = SecretKey::from_slice(&three).unwrap();
+    // sk_one.mul_assign(&sk_three.0);
+    assert_eq!(sk_two, sk_one);
+  }
+
+  #[test]
+  fn test_bigint_mul() {
+    let left = hex::decode("07fb56a3668cd6dcdaf91d986675a1f3cacd66af4eced9f3791ea739934a752e").unwrap();
+    let right = hex::decode("03c16ceac5293e0bf8a29e5a628f567bf5cff88175f292a8e9c9ce07d3d8d489").unwrap();
+    let mut left_key = SecretKey::from_slice(&left).unwrap();
+    let right_key = SecretKey::from_slice(&right).unwrap();
+
+    let mut left_mul_right = left_key.clone();
+    left_mul_right.mul_assign(&right_key).unwrap();
+
+    println!("left mul right  {:?}", left_mul_right.to_string());
+    let mut left_point = PublicKey::from_secret_key(&left_mul_right);
+
+    let mut right_point = PublicKey::from_secret_key(&left_key);
+    right_point.mul_assign(&right_key);
+
+
+    // let num_from_mod_n = hex::decode("07b97fbd845284402f5fec9c02a61c9fdde835f9605cd3d875f0a735a927035b").unwrap();
+    // let sk_from_mod_n = SecretKey::from_slice(&num_from_mod_n).unwrap();
+    // let mut point2 = PublicKey::from_secret_key(&sk_from_mod_n);
+    assert_eq!(hex::encode(left_point.serialize_uncompressed()), hex::encode(right_point.serialize_uncompressed()));
+  }
+
+  #[test]
+  fn test_from_scala() {
+    let scala = hex::decode("053ce0e384325169d57e2e42afe9301dd95b830f75043c75394912284303d5d5").unwrap();
+    let sk = SecretKey::from_slice(&scala);
+    assert!(sk.is_ok());
+  }
+
+}
 // #[cfg(test)]
 // mod test {
 //   use super::super::Error::{InvalidPublicKey, InvalidSecretKey};
