@@ -542,7 +542,6 @@ impl PublicKey {
         let pk_in_be = Self::parse_pk_from_le(&buffer);
         Ok(pk_in_be)
       } else {
-        println!("public key add error: {}", str::from_utf8(&buffer).unwrap());
         Ok(Self::zero())
       }
     }
@@ -566,8 +565,6 @@ impl PublicKey {
       let mut other_bytes = [0u8; SECRET_KEY_SIZE];
       other_bytes.copy_from_slice(&other.0);
       other_bytes.reverse();
-
-      println!("need rebuild 02");
 
       if PubkeyTweakMul(pk_in_le.as_c_ptr(), other_bytes.as_ptr(), buffer.as_mut_ptr()) == 0 {
         let pk_in_be = Self::parse_pk_from_le(&buffer);
@@ -804,7 +801,6 @@ mod test {
     let mut left_mul_right = left_key.clone();
     left_mul_right.mul_assign(&right_key).unwrap();
 
-    println!("left mul right  {:?}", left_mul_right.to_string());
     let mut left_point = PublicKey::from_secret_key(&left_mul_right);
 
     let mut right_point = PublicKey::from_secret_key(&left_key);

@@ -15,7 +15,6 @@ fn main() {
         .file("lib/starkware-crypto/src/starkware/crypto/pedersen_hash.cc")
         .include("lib/starkware-crypto/src")
         .flag("-std=c++17")
-        .flag("-Werror")
         .flag("-Wall")
         .flag("-Wextra")
         .flag("-fno-strict-aliasing")
